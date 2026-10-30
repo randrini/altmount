@@ -512,6 +512,17 @@ func stremioPlayNzbFilename(candidate stremioPlayCandidate) string {
 	return fmt.Sprintf("%s-%x.nzb", candidate.SafeTitle, hash[:8])
 }
 
+// stremioUploadNzbFilename names the NZB an upload queues. The upload carries a
+// transport filename that may keep a .gz suffix, so the play path's URL hash is
+// inserted before the extension instead of replacing it.
+func stremioUploadNzbFilename(filename string, candidate stremioPlayCandidate) string {
+	name := stremioPlayNzbFilename(candidate)
+	if strings.HasSuffix(strings.ToLower(filename), ".nzb.gz") {
+		name += ".gz"
+	}
+	return name
+}
+
 // stremioQueueItemReleaseKey returns the release fingerprint stored on a queue
 // item, when the row has one.
 func stremioQueueItemReleaseKey(item *database.ImportQueueItem) (string, bool) {

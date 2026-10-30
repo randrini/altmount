@@ -17,12 +17,12 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/javi11/nzbparser"
 	"github.com/kipsilabs/altmount/internal/auth"
 	"github.com/kipsilabs/altmount/internal/database"
 	"github.com/kipsilabs/altmount/internal/httpclient"
 	"github.com/kipsilabs/altmount/internal/importer/parser/fileinfo"
 	"github.com/kipsilabs/altmount/internal/importer/utils/nzbtrim"
-	"github.com/javi11/nzbparser"
 )
 
 // mediaExtensions lists common video/media file extensions for Stremio stream filtering.
@@ -239,18 +239,42 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 
 	// --- Derive stable names before touching the filesystem ---
 	uploadDir := filepath.Join(os.TempDir(), "altmount-uploads")
-	safeFilename := filepath.Base(nzbFilename)
-	nzbName := nzbtrim.TrimNzbExtension(safeFilename)
+	baseFilename := filepath.Base(nzbFilename)
+	nzbName := nzbtrim.TrimNzbExtension(baseFilename)
+
+	// --- Resolve release identity ---
+	// nzb_url names the exact NZB bytes the indexer serves, so it carries the
+	// same release identity the play path uses. It goes into the queued filename
+	// and the dedup key, keeping two same-titled releases on separate queue
+	// entries instead of letting one answer for the other. A raw file upload has
+	// no download URL to hash, so that flow keeps identifying a release by title
+	// alone (best effort: bytes and title are all the caller gave us).
+	explicitRelease := nzbURL != ""
+	safeFilename := baseFilename
+	releaseKey := ""
+	if explicitRelease {
+		releaseCandidate := stremioPlayCandidate{SafeTitle: nzbName, DownloadURL: nzbURL}
+		releaseKey = stremioReleaseKey(releaseCandidate)
+		safeFilename = stremioUploadNzbFilename(baseFilename, releaseCandidate)
+	} else {
+		slog.InfoContext(ctx, "Stremio NZB upload has no download URL; falling back to title-based dedup",
+			"nzb_name", nzbName)
+	}
 	tempPath := filepath.Join(uploadDir, safeFilename)
 
-	// --- Find or add NZB to queue, deduplicated per filename ---
-	// stremioPlayGroup serialises all callers with the same safeFilename: the first
-	// one runs the full find-or-add path; concurrent duplicates (e.g. two users
-	// requesting the same release simultaneously) wait and share the returned queue
-	// item ID, preventing the TOCTOU race that previously created duplicate entries.
+	// --- Find or add NZB to queue, deduplicated per release ---
+	// stremioPlayGroup serialises all callers with the same release identity: the
+	// first one runs the full find-or-add path; concurrent duplicates (e.g. two
+	// users requesting the same release simultaneously) wait and share the
+	// returned queue item ID, preventing the TOCTOU race that previously created
+	// duplicate entries. Title-only uploads key on the filename instead.
+	groupKey := safeFilename
+	if releaseKey != "" {
+		groupKey = releaseKey
+	}
 	ttlHours := cfg.Stremio.NzbTTLHours
 
-	rawID, sfErr, _ := s.stremioPlayGroup.Do(safeFilename, func() (interface{}, error) {
+	rawID, sfErr, _ := s.stremioPlayGroup.Do(groupKey, func() (interface{}, error) {
 		// Detach from the caller's request context so one client disconnecting
 		// does not abort work that other concurrent callers are also waiting on.
 		workCtx := context.WithoutCancel(ctx)
@@ -261,7 +285,15 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		// callers can't both miss it and both enqueue the same NZB.
 		if existing, e := s.queueRepo.ListQueueItems(workCtx, &completedStatus, safeFilename, "", 1, 0, "updated_at", "desc"); e == nil && len(existing) > 0 {
 			prev := existing[0]
-			cacheValid := prev.StoragePath != nil && *prev.StoragePath != ""
+			// An explicit release may only reuse the queued bytes of that exact
+			// release. Keyless legacy rows cannot prove identity, so they are
+			// skipped rather than trusted by title.
+			if explicitRelease {
+				if storedKey, keyed := stremioQueueItemReleaseKey(prev); !keyed || storedKey != releaseKey {
+					prev = nil
+				}
+			}
+			cacheValid := prev != nil && prev.StoragePath != nil && *prev.StoragePath != ""
 			if cacheValid && ttlHours > 0 && prev.CompletedAt != nil {
 				cacheValid = time.Since(*prev.CompletedAt) < time.Duration(ttlHours)*time.Hour
 			}
@@ -275,9 +307,16 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		// Join an existing active queue item instead of re-adding.
 		if activeItems, e := s.queueRepo.ListQueueItems(workCtx, nil, safeFilename, "", 1, 0, "updated_at", "desc"); e == nil && len(activeItems) > 0 {
 			it := activeItems[0]
-			switch it.Status {
-			case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
-				return it.ID, nil
+			if explicitRelease {
+				if storedKey, keyed := stremioQueueItemReleaseKey(it); !keyed || storedKey != releaseKey {
+					it = nil
+				}
+			}
+			if it != nil {
+				switch it.Status {
+				case database.QueueStatusPending, database.QueueStatusProcessing, database.QueueStatusPaused:
+					return it.ID, nil
+				}
 			}
 		}
 
@@ -302,7 +341,18 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		}
 
 		priority := database.QueuePriorityHigh
-		item, err := s.importerService.AddToQueue(workCtx, tempPath, basePath, &category, &priority, nil, nil, nil)
+		// Store the release fingerprint so later requests for the same title
+		// with a different URL cannot reuse this row. Title-only uploads have no
+		// key to store and keep the historical keyless row.
+		var metadataPtr *string
+		if explicitRelease {
+			var metadataErr error
+			metadataPtr, metadataErr = encodeStremioQueueMetadata(stremioQueueMetadata{ReleaseKey: releaseKey})
+			if metadataErr != nil {
+				return nil, fmt.Errorf("failed to encode Stremio queue metadata: %w", metadataErr)
+			}
+		}
+		item, err := s.importerService.AddToQueue(workCtx, tempPath, basePath, &category, &priority, metadataPtr, nil, nil)
 		if err != nil {
 			os.Remove(tempPath)
 			return nil, fmt.Errorf("failed to add NZB to queue: %w", err)
@@ -311,6 +361,7 @@ func (s *Server) handleNzbStreams(c *fiber.Ctx) error {
 		slog.InfoContext(workCtx, "NZB added to queue for Stremio stream processing",
 			"queue_id", item.ID,
 			"nzb_path", tempPath,
+			"release_key", releaseKey,
 			"timeout_secs", timeoutSecs)
 
 		return item.ID, nil
