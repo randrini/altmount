@@ -55,6 +55,10 @@ type ImportQueueItem struct {
 	SkipArrNotification bool          `db:"skip_arr_notification"`
 	SkipPostImportLinks bool          `db:"skip_post_import_links"`
 	Indexer             *string       `db:"indexer"`
+	// ContentIdentity fingerprints the release's largest payload file from its
+	// size and ordered Usenet message-IDs. It is used only for queue-admission
+	// de-duplication, so most row reads leave it unset.
+	ContentIdentity *string `db:"content_identity"`
 }
 
 // BulkOperationResult represents the result of a bulk queue operation
@@ -69,11 +73,11 @@ type BulkOperationResult struct {
 
 // QueueStats represents statistics about the import queue
 type QueueStats struct {
-	ID                  int64     `db:"id"`
-	TotalQueued         int       `db:"total_queued"`
-	TotalProcessing     int       `db:"total_processing"`
-	TotalCompleted      int       `db:"total_completed"`
-	TotalFailed         int       `db:"total_failed"`
+	ID              int64 `db:"id"`
+	TotalQueued     int   `db:"total_queued"`
+	TotalProcessing int   `db:"total_processing"`
+	TotalCompleted  int   `db:"total_completed"`
+	TotalFailed     int   `db:"total_failed"`
 	// TotalWaitingRepair counts imports parked for a PAR2 repair. Counted
 	// live; queue_stats has no column for it.
 	TotalWaitingRepair  int       `db:"-"`
@@ -189,18 +193,18 @@ type ImportHourlyStat struct {
 
 // ImportHistory represents a persistent record of a single imported file
 type ImportHistory struct {
-	ID                  int64     `db:"id"`
-	DownloadID          *string   `db:"download_id"`
-	NzbID               *int64    `db:"nzb_id"` // Nullable if queue item deleted
-	NzbName             string    `db:"nzb_name"`
-	FileName            string    `db:"file_name"`
-	FileSize            int64     `db:"file_size"`
-	VirtualPath         string    `db:"virtual_path"`
-	LibraryPath         *string   `db:"library_path"` // Added to show final location from file_health
-	Category            *string   `db:"category"`
-	Metadata            *string   `db:"metadata"`
-	Indexer             *string   `db:"indexer"`
-	CompletedAt         time.Time `db:"completed_at"`
+	ID          int64     `db:"id"`
+	DownloadID  *string   `db:"download_id"`
+	NzbID       *int64    `db:"nzb_id"` // Nullable if queue item deleted
+	NzbName     string    `db:"nzb_name"`
+	FileName    string    `db:"file_name"`
+	FileSize    int64     `db:"file_size"`
+	VirtualPath string    `db:"virtual_path"`
+	LibraryPath *string   `db:"library_path"` // Added to show final location from file_health
+	Category    *string   `db:"category"`
+	Metadata    *string   `db:"metadata"`
+	Indexer     *string   `db:"indexer"`
+	CompletedAt time.Time `db:"completed_at"`
 }
 
 // ImportMigrationStatus represents the status of a migration item
