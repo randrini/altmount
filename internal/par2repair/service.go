@@ -162,7 +162,7 @@ type Service struct {
 
 	// resolveNzb plans an NZB-mode repair; replaced in tests. The default
 	// parses the NZB from disk and calls ResolveFromNzb.
-	resolveNzb func(ctx context.Context, nzbPath string, deadIDs []string, progress JobProgress) (*Resolution, error)
+	resolveNzb func(ctx context.Context, nzbPath string, deadIDs []string, attempt int, progress JobProgress) (*Resolution, error)
 
 	// execute runs one claimed job; replaced in tests. The default is
 	// (*Service).executeJob.
@@ -374,7 +374,16 @@ func (s *Service) handleOutcome(ctx context.Context, job *database.Par2RepairJob
 		s.resumeImport(ctx, job)
 		s.deleteJob(ctx, job.ID)
 		s.pruneStore(ctx)
-	case errors.Is(err, ErrUnrepairable), errors.Is(err, ErrNothingToRepair):
+	case errors.Is(err, ErrNothingToRepair):
+		s.log.InfoContext(ctx, "PAR2 verification found nothing to repair", "file", job.FilePath)
+		for _, member := range s.jobMembers(ctx, job) {
+			s.markFileHealthy(ctx, member)
+		}
+		// An intact release cannot fix a deferred import's analysis failure;
+		// resuming it would loop through the same failure indefinitely.
+		s.failImport(ctx, job, err.Error())
+		s.deleteJob(ctx, job.ID)
+	case errors.Is(err, ErrUnrepairable):
 		s.log.WarnContext(ctx, "PAR2 repair not possible", "file", job.FilePath, "reason", err)
 		for _, member := range s.jobMembers(ctx, job) {
 			s.markFileUnrepairable(ctx, member, err.Error())
@@ -394,6 +403,18 @@ func (s *Service) handleOutcome(ctx context.Context, job *database.Par2RepairJob
 			return
 		}
 		delay := min(baseBackoff<<job.Attempts, maxBackoff)
+		var short *RecoveryShortError
+		if errors.As(err, &short) {
+			// The plan's own rows were the problem, so the retry doesn't need
+			// to wait for anything: it reads further into the PAR2 set.
+			for _, id := range short.Dead {
+				if perr := s.repo.AppendDeadSegment(ctx, job.ID, id); perr != nil {
+					s.log.ErrorContext(ctx, "Failed to persist unusable recovery article",
+						"error", perr, "job", job.ID, "message_id", id)
+				}
+			}
+			delay = baseBackoff
+		}
 		var sweepDead *SweepDeadArticleError
 		if errors.As(err, &sweepDead) {
 			// Every article the sweep proved dead — the one that broke the
@@ -515,7 +536,7 @@ func (s *Service) markFileHealthy(ctx context.Context, filePath string) {
 		}
 	}
 	if s.health != nil {
-		note := "restored by PAR2 repair"
+		note := "verified healthy by PAR2 repair"
 		if err := s.health.UpdateFileHealth(ctx, filePath, database.HealthStatusHealthy, nil, nil, &note, false); err != nil {
 			s.log.ErrorContext(ctx, "Failed to flip health record to healthy after repair",
 				"error", err, "file", filePath)
@@ -556,6 +577,7 @@ func (s *Service) executeJob(ctx context.Context, job *database.Par2RepairJob) e
 	deadIDs := mergeDeadIDs(deadSegmentIDs(fm, job.FailingSegmentID.String), job.DeadSegments())
 	cfg := s.cfg()
 	caps := cfg.caps()
+	caps.RecoveryAttempt = job.Attempts
 	defer s.clearProgress(job.ID)
 	progress := s.jobProgress(job.ID)
 	fetch := s.fetcherFor(metaArticleDate(fm))
@@ -657,7 +679,7 @@ func (s *Service) executeNzbJob(ctx context.Context, job *database.Par2RepairJob
 	progress := s.jobProgress(job.ID)
 	log := s.log.With("job", job.ID, "nzb", job.NzbPath.String)
 	planningStarted := time.Now()
-	res, err := s.resolveNzb(ctx, job.NzbPath.String, deadIDs, progress)
+	res, err := s.resolveNzb(ctx, job.NzbPath.String, deadIDs, job.Attempts, progress)
 	log.InfoContext(ctx, "PAR2 planning performance", "elapsed", time.Since(planningStarted), "error", err)
 	if err != nil {
 		return err
@@ -668,7 +690,7 @@ func (s *Service) executeNzbJob(ctx context.Context, job *database.Par2RepairJob
 }
 
 // resolveNzbFromDisk parses the NZB at nzbPath and plans a repair from it.
-func (s *Service) resolveNzbFromDisk(ctx context.Context, nzbPath string, deadIDs []string, progress JobProgress) (*Resolution, error) {
+func (s *Service) resolveNzbFromDisk(ctx context.Context, nzbPath string, deadIDs []string, attempt int, progress JobProgress) (*Resolution, error) {
 	rc, err := nzbfile.Open(nzbPath)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open NZB %s: %v", ErrUnrepairable, nzbPath, err)
@@ -680,6 +702,7 @@ func (s *Service) resolveNzbFromDisk(ctx context.Context, nzbPath string, deadID
 		return nil, fmt.Errorf("%w: parse NZB %s: %v", ErrUnrepairable, nzbPath, err)
 	}
 	caps := s.cfg().caps()
+	caps.RecoveryAttempt = attempt
 	// No known-dead segment means the trigger saw corrupt article DATA (e.g.
 	// RAR analysis failed on a present article), not a missing one: run a
 	// verify sweep that checks every article against the PAR2 checksums and

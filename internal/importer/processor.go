@@ -3,7 +3,6 @@ package importer
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -70,6 +69,17 @@ type Processor struct {
 // that is most likely to succeed right now, while the recovery volumes are
 // still retrievable.
 var ErrDeferredForRepair = errors.New("import deferred pending PAR2 repair")
+
+// articlesPastEndError reports that a release's missing articles include dead
+// ones listed past the end of a file. keep is how many articles to keep, by
+// file index.
+type articlesPastEndError struct {
+	keep map[int]int
+}
+
+func (e *articlesPastEndError) Error() string {
+	return "dead articles listed past the end of a file"
+}
 
 // shouldDeferForRepair decides whether a damaged release waits for a PAR2
 // repair instead of being dropped. Deferring needs the feature enabled, PAR2
@@ -535,6 +545,15 @@ func (proc *Processor) preParseFastFail(ctx context.Context, n *nzbparser.Nzb, c
 				"duration", time.Since(probeStart))
 		}
 	default:
+		// Some posts list dead articles past the end of a file. Those are not
+		// damage, so the miss may mean nothing at all: have the caller trim
+		// them and check again before judging the release.
+		if proc.parser != nil {
+			if keep := proc.parser.FindDeadArticlesPastEnd(ctx, n.Files); len(keep) > 0 {
+				return nil, nil, nil, &articlesPastEndError{keep: keep}
+			}
+		}
+
 		isStremioImport := (category != nil && *category == "stremio") || (downloadID != nil && strings.HasPrefix(*downloadID, "stremio:"))
 		// A miss confined to sidecars (a separately posted .nfo often expires
 		// on its own) says nothing about the media: escalate so the sweep
@@ -997,8 +1016,12 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			return "", nil, fmt.Errorf("failed to close NZB file: %w", err)
 		}
 
-		seen := make(map[[32]byte]struct{})
-		for depth := 0; ; depth++ {
+		chain, chainErr := readNestedNzbChain(metadata)
+		if chainErr != nil {
+			return "", nil, chainErr
+		}
+		var resolved []byte
+		for {
 			parser.SanitizeNzbFilenames(n)
 
 			// Articles the NZB never listed become sized placeholders, so later
@@ -1028,6 +1051,13 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			}
 			<-warmDone
 			cancelWarm()
+			// Trimmed here, not in the check: the warm-up reads n.Files until
+			// warmDone closes.
+			var pastEnd *articlesPastEndError
+			if errors.As(fastFailErr, &pastEnd) {
+				proc.parser.TrimArticles(ctx, n.Files, pastEnd.keep)
+				brokenIdx, missingIDs, degradedFiles, fastFailErr = proc.preParseFastFail(ctx, n, cfg, queueID, category, downloadID)
+			}
 			if fastFailErr != nil {
 				// A deferral is not a failure: propagate it so the service parks
 				// the queue item pending the repair. Checked before the
@@ -1059,27 +1089,37 @@ func (proc *Processor) ProcessNzbFile(ctx context.Context, filePath, relativePat
 			degradedFiles = mergeDegradedFiles(degradedFiles, parsed.DegradedFiles)
 
 			inner, resolveErr := proc.resolveNestedNzb(ctx, parsed)
+			var jobs *nestedNzbJobsError
+			if errors.As(resolveErr, &jobs) {
+				for _, job := range jobs.Jobs {
+					if _, err := chain.follow(job.Data); err != nil {
+						return "", nil, err
+					}
+				}
+				jobs.Chain = chain
+				return "", nil, jobs
+			}
 			if resolveErr != nil {
 				return "", nil, fmt.Errorf("failed to resolve embedded NZB: %w", resolveErr)
 			}
 			if inner == nil {
+				if resolved != nil {
+					if err := persistNestedNzb(filePath, resolved); err != nil {
+						return "", nil, fmt.Errorf("failed to persist embedded NZB: %w", err)
+					}
+				}
 				break
 			}
-			if depth >= maxNestedNzbDepth {
-				return "", nil, NewNonRetryableError("embedded NZB nesting limit exceeded", nil)
+			chain, err = chain.follow(inner)
+			if err != nil {
+				return "", nil, err
 			}
-			hash := sha256.Sum256(inner)
-			if _, exists := seen[hash]; exists {
-				return "", nil, NewNonRetryableError("embedded NZB cycle detected", nil)
-			}
-			seen[hash] = struct{}{}
+			resolved = inner
 			n, err = nzbparser.Parse(bytes.NewReader(inner))
 			if err != nil {
 				return "", nil, NewNonRetryableError("failed to parse embedded NZB", err)
 			}
-			if err := persistNestedNzb(filePath, inner); err != nil {
-				return "", nil, fmt.Errorf("failed to persist embedded NZB: %w", err)
-			}
+
 			// Wrapper extraction metadata describes the wrapper, not the release.
 			extractedFiles = nil
 			proc.updateProgressWithStage(queueID, 0, "Resolving embedded NZB")
